@@ -1,0 +1,926 @@
+'use client'
+
+import { useState, useEffect, useRef } from 'react'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Card, CardContent } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import { Separator } from '@/components/ui/separator'
+import {
+  Search,
+  Play,
+  Download,
+  Trash2,
+  Clock,
+  Eye,
+  User,
+  Home,
+  Library,
+  TrendingUp,
+  Music,
+  Gamepad2,
+  Film,
+  Radio,
+  Menu,
+  X,
+  Loader2,
+  AlertCircle,
+  CheckCircle,
+  FolderOpen,
+  HardDrive
+} from 'lucide-react'
+
+// Types
+interface VideoResult {
+  id: string
+  title: string
+  thumbnail: string
+  duration: number
+  uploader: string
+  view_count: number
+  url: string
+}
+
+interface VideoFormat {
+  format_id: string
+  ext: string
+  resolution: string
+  height: number
+  fps: number
+  filesize: number
+  filesize_formatted: string
+  vcodec: string
+  acodec: string
+  note: string
+  has_audio: boolean
+}
+
+interface VideoInfo {
+  id: string
+  title: string
+  description: string
+  thumbnail: string
+  duration: number
+  duration_formatted: string
+  uploader: string
+  view_count: number
+  formats: VideoFormat[]
+  audio_formats: VideoFormat[]
+  url: string
+}
+
+interface DownloadedVideo {
+  id: string
+  title: string
+  filename: string
+  filepath: string
+  thumbnail: string
+  duration: number
+  resolution: string
+  size: number
+  size_formatted: string
+  downloaded_at: string
+}
+
+interface DownloadProgress {
+  status: string
+  progress: number | null
+  speed: string
+  eta: string
+  filename: string
+  error?: string
+  selected_format_id?: string
+  selected_height?: number | null
+  requested_resolution?: number | null
+}
+
+// Utility functions
+function formatDuration(seconds: number): string {
+  if (!seconds) return '0:00'
+  const hrs = Math.floor(seconds / 3600)
+  const mins = Math.floor((seconds % 3600) / 60)
+  const secs = seconds % 60
+  if (hrs > 0) {
+    return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+  }
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}
+
+function formatViews(views: number): string {
+  if (!views) return '0 views'
+  if (views >= 1000000) {
+    return `${(views / 1000000).toFixed(1)}M views`
+  }
+  if (views >= 1000) {
+    return `${(views / 1000).toFixed(1)}K views`
+  }
+  return `${views} views`
+}
+
+// Components
+function VideoCard({ video, onPlay, onDownload }: {
+  video: VideoResult
+  onPlay: (video: VideoResult) => void
+  onDownload: (video: VideoResult) => void
+}) {
+  return (
+    <Card className="group overflow-hidden border-0 shadow-md hover:shadow-xl transition-all duration-300 bg-card">
+      <div className="relative aspect-video bg-muted overflow-hidden">
+        <img
+          src={video.thumbnail}
+          alt={video.title}
+          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+          loading="lazy"
+        />
+        <div className="absolute bottom-2 right-2 bg-black/80 text-white text-xs px-2 py-1 rounded">
+          {formatDuration(video.duration)}
+        </div>
+        {/* Overlay con botones - visible siempre en móvil, hover en desktop */}
+        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-300 flex items-center justify-center gap-2 opacity-100 sm:opacity-0 group-hover:opacity-100">
+          <Button
+            size="icon"
+            className="rounded-full bg-red-600 hover:bg-red-700 h-12 w-12 shadow-lg"
+            onClick={(e) => { e.stopPropagation(); onPlay(video) }}
+            title="Reproducir online"
+          >
+            <Play className="h-5 w-5 fill-white" />
+          </Button>
+          <Button
+            size="icon"
+            variant="secondary"
+            className="rounded-full h-10 w-10 shadow-lg"
+            onClick={(e) => { e.stopPropagation(); onDownload(video) }}
+            title="Descargar"
+          >
+            <Download className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+      <CardContent className="p-3">
+        <h3 className="font-medium text-sm line-clamp-2 leading-tight mb-1">{video.title}</h3>
+        <p className="text-xs text-muted-foreground">{video.uploader}</p>
+        <p className="text-xs text-muted-foreground">{formatViews(video.view_count)}</p>
+      </CardContent>
+    </Card>
+  )
+}
+
+function LibraryVideoCard({ video, onPlay, onDelete }: {
+  video: DownloadedVideo
+  onPlay: (video: DownloadedVideo) => void
+  onDelete: (filename: string) => void
+}) {
+  return (
+    <Card className="group overflow-hidden border-0 shadow-md hover:shadow-xl transition-all duration-300 bg-card">
+      <div className="relative aspect-video bg-muted overflow-hidden">
+        {video.thumbnail ? (
+          <img
+            src={video.thumbnail}
+            alt={video.title}
+            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+            loading="lazy"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/20 to-primary/5">
+            <FolderOpen className="h-12 w-12 text-primary/40" />
+          </div>
+        )}
+        <Badge className="absolute top-2 left-2 bg-green-600 text-white text-xs">
+          <CheckCircle className="h-3 w-3 mr-1" /> Offline
+        </Badge>
+        <Badge className="absolute top-2 right-2 bg-black/70 text-white text-xs">
+          {video.size_formatted}
+        </Badge>
+        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-300 flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100">
+          <Button
+            size="icon"
+            className="rounded-full bg-green-600 hover:bg-green-700 h-12 w-12"
+            onClick={() => onPlay(video)}
+          >
+            <Play className="h-5 w-5 fill-white" />
+          </Button>
+          <Button
+            size="icon"
+            variant="destructive"
+            className="rounded-full h-10 w-10"
+            onClick={() => onDelete(video.filename)}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+      <CardContent className="p-3">
+        <h3 className="font-medium text-sm line-clamp-2 leading-tight mb-1">{video.title}</h3>
+        <p className="text-xs text-muted-foreground">{video.resolution}</p>
+      </CardContent>
+    </Card>
+  )
+}
+
+function PlayerModal({ video, isOpen, onClose, isOffline }: {
+  video: VideoResult | DownloadedVideo | null
+  isOpen: boolean
+  onClose: () => void
+  isOffline: boolean
+}) {
+  if (!video) return null
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-5xl w-full p-0 overflow-hidden bg-black border-0">
+        <DialogHeader className="sr-only">
+          <DialogTitle>{video.title}</DialogTitle>
+        </DialogHeader>
+
+        <div className="relative aspect-video bg-black">
+          {isOffline ? (
+            <video
+              src={`/api/stream/${(video as DownloadedVideo).filename}?XTransformPort=8001`}
+              controls
+              autoPlay
+              className="w-full h-full"
+            />
+          ) : (
+            <iframe
+              src={`https://www.youtube.com/embed/${video.id}?autoplay=1`}
+              className="w-full h-full"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            />
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="absolute top-2 right-2 bg-black/50 hover:bg-black/70 text-white"
+            onClick={onClose}
+          >
+            <X className="h-5 w-5" />
+          </Button>
+        </div>
+        <div className="p-4 bg-background">
+          <h2 className="text-lg font-semibold mb-2">{video.title}</h2>
+          <div className="flex items-center gap-4 text-sm text-muted-foreground">
+            <span className="flex items-center gap-1">
+              <User className="h-4 w-4" />
+              {(video as VideoResult).uploader || 'Unknown'}
+            </span>
+            {video.duration > 0 && (
+              <span className="flex items-center gap-1">
+                <Clock className="h-4 w-4" />
+                {formatDuration(video.duration)}
+              </span>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function DownloadModal({ video, isOpen, onClose, onDownload, onPlayOnline, onStartDownload, downloadProgress }: {
+  video: VideoResult | null
+  isOpen: boolean
+  onClose: () => void
+  onDownload: (formatId: string, resolution: string) => void
+  onPlayOnline: () => void
+  onStartDownload: (formatId: string, resolution: string) => void
+  downloadProgress?: DownloadProgress | null
+}) {
+  const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [selectedFormat, setSelectedFormat] = useState<string>('')
+
+  useEffect(() => {
+    if (!isOpen || !video) return
+
+    let mounted = true
+
+    const fetchVideoInfo = async () => {
+      if (!mounted) return
+      
+      setLoading(true)
+      setError(null)
+      setVideoInfo(null)
+
+      try {
+        const res = await fetch(`/api/video/info?url=${encodeURIComponent(video.url)}&XTransformPort=8001`)
+        const data = await res.json()
+        
+        if (!mounted) return
+        
+        if (data.error) {
+          setError(data.error)
+        } else {
+          setVideoInfo(data)
+          if (data.formats && data.formats.length > 0) {
+            setSelectedFormat(data.formats[0].format_id)
+          }
+        }
+      } catch {
+        if (mounted) {
+          setError('Error al obtener información del video')
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false)
+        }
+      }
+    }
+
+    fetchVideoInfo()
+
+    return () => {
+      mounted = false
+    }
+  }, [isOpen, video])
+
+  const handleDownload = () => {
+    if (!video || !selectedFormat || !videoInfo) return
+
+    // delegate download to parent (background manager)
+    onStartDownload(selectedFormat, (videoInfo.formats.find(f => f.format_id === selectedFormat)?.height || 720).toString())
+  }
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Download className="h-5 w-5" />
+            Descargar Video
+          </DialogTitle>
+          <DialogDescription>
+            Selecciona la calidad de descarga
+          </DialogDescription>
+        </DialogHeader>
+
+        {video && (
+          <div className="flex gap-3 mb-4">
+            <img
+              src={video.thumbnail}
+              alt={video.title}
+              className="w-32 aspect-video object-cover rounded-lg"
+            />
+            <div className="flex-1 min-w-0">
+              <h3 className="font-medium text-sm line-clamp-2">{video.title}</h3>
+              <p className="text-xs text-muted-foreground mt-1">{video.uploader}</p>
+            </div>
+          </div>
+        )}
+
+        {loading && (
+          <div className="flex items-center justify-center py-8">
+            <Loader2 className="h-8 w-8 animate-spin text-primary" />
+          </div>
+        )}
+
+        {error && (
+          <div className="flex items-center gap-2 p-4 bg-destructive/10 text-destructive rounded-lg">
+            <AlertCircle className="h-5 w-5 flex-shrink-0" />
+            <p className="text-sm">{error}</p>
+          </div>
+        )}
+
+        {videoInfo && !(downloadProgress && ['starting','downloading','processing','finished'].includes(downloadProgress.status || '')) && (
+          <div className="space-y-4">
+            {/* Botón de reproducir online */}
+            {videoInfo.can_play_online && (
+              <Button 
+                variant="default" 
+                className="w-full bg-red-600 hover:bg-red-700"
+                onClick={() => {
+                  onPlayOnline()
+                  onClose()
+                }}
+              >
+                <Play className="h-4 w-4 mr-2" />
+                Reproducir Online
+              </Button>
+            )}
+            
+            {videoInfo.limited_info && (
+              <div className="p-3 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 rounded-lg text-sm">
+                <AlertCircle className="h-4 w-4 inline mr-2" />
+                Información limitada. El video se puede descargar.
+              </div>
+            )}
+            
+            <div>
+              <label className="text-sm font-medium mb-2 block">Calidad de Descarga</label>
+              <Select value={selectedFormat} onValueChange={setSelectedFormat}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Selecciona calidad" />
+                </SelectTrigger>
+                <SelectContent>
+                  {videoInfo.formats.map((format) => (
+                    <SelectItem key={format.format_id} value={format.format_id}>
+                      <div className="flex items-center justify-between gap-4 w-full">
+                        <span>{format.resolution} {format.fps > 0 ? `(${format.fps}fps)` : ''}</span>
+                        {format.filesize_formatted !== 'N/A' && (
+                          <span className="text-muted-foreground">{format.filesize_formatted}</span>
+                        )}
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={onClose} className="flex-1">
+                Cancelar
+              </Button>
+              <Button onClick={handleDownload} className="flex-1">
+                <Download className="h-4 w-4 mr-2" />
+                Descargar
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {downloadProgress && (
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span>{downloadProgress.status === 'downloading' ? 'Descargando...' : downloadProgress.status === 'finished' ? 'Procesando...' : 'Completado'}</span>
+                <span>
+                  {typeof downloadProgress.progress === 'number' && !isNaN(downloadProgress.progress)
+                    ? `${Math.min(Math.max(downloadProgress.progress, 0), 100).toFixed(1)}%`
+                    : (downloadProgress.status === 'complete' || downloadProgress.status === 'finished') ? '100%' : '—'
+                  }
+                </span>
+              </div>
+
+              <div className="w-full bg-secondary rounded-full h-2">
+                <div
+                  className="bg-primary h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(typeof downloadProgress.progress === 'number' && !isNaN(downloadProgress.progress)) ? Math.min(Math.max(downloadProgress.progress, 0), 100) : (downloadProgress.status === 'complete' || downloadProgress.status === 'finished' ? 100 : 0)}%` }}
+                />
+              </div>
+
+              {downloadProgress.speed && downloadProgress.speed !== 'N/A' && (
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>Velocidad: {downloadProgress.speed}</span>
+                  <span>Tiempo restante: {downloadProgress.eta}</span>
+                </div>
+              )}
+
+              {/* Show requested vs actual resolution when they differ */}
+              {downloadProgress.requested_resolution && (downloadProgress.selected_height != null) && downloadProgress.selected_height !== downloadProgress.requested_resolution && (
+                <div className="text-xs text-muted-foreground mt-2">
+                  <strong>Solicitado:</strong> {downloadProgress.requested_resolution}p • <strong>Descargando:</strong> {downloadProgress.selected_height}p
+                </div>
+              )}
+
+              {downloadProgress.requested_resolution && (downloadProgress.selected_height != null) && downloadProgress.selected_height === downloadProgress.requested_resolution && (
+                <div className="text-xs text-muted-foreground mt-2">Resolución: {downloadProgress.selected_height}p</div>
+              )}
+            </div>
+
+            {downloadProgress.status === 'error' && (
+              <div className="flex items-center gap-2 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
+                <AlertCircle className="h-4 w-4" />
+                {downloadProgress.error}
+              </div>
+            )}
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Main Page
+export default function OfflineTube() {
+  const [searchQuery, setSearchQuery] = useState('')
+  const [videos, setVideos] = useState<VideoResult[]>([])
+  const [libraryVideos, setLibraryVideos] = useState<DownloadedVideo[]>([])
+  const [loading, setLoading] = useState(false)
+  const [activeTab, setActiveTab] = useState('home')
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [selectedCategory, setSelectedCategory] = useState('')
+
+  // Modals
+  const [playingVideo, setPlayingVideo] = useState<VideoResult | DownloadedVideo | null>(null)
+  const [showPlayer, setShowPlayer] = useState(false)
+  const [isOfflinePlay, setIsOfflinePlay] = useState(false)
+  const [downloadingVideo, setDownloadingVideo] = useState<VideoResult | null>(null)
+  const [showDownload, setShowDownload] = useState(false)
+
+  // Background download manager (keeps downloads running even if modal closes)
+  const [downloads, setDownloads] = useState<Record<string, DownloadProgress & { title?: string; videoId?: string }>>({})
+  const wsRefs = useRef<Record<string, WebSocket>>({})
+
+  // Start a websocket-backed download (managed at page level so it survives modal close)
+  const startDownload = (video: VideoResult, formatId: string, resolution: string) => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const downloadKey = `${video.id}_${Date.now()}`
+
+    // optimistic entry so UI shows an item immediately
+    setDownloads((d) => ({
+      ...d,
+      [downloadKey]: { status: 'starting', progress: null, speed: 'N/A', eta: 'N/A', filename: '', title: video.title, videoId: video.id, requested_resolution: Number(resolution) || null }
+    }))
+
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/download?XTransformPort=8001`)
+    wsRefs.current[downloadKey] = ws
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        type: 'download',
+        url: video.url,
+        format_id: formatId,
+        resolution: resolution
+      }))
+    }
+
+    ws.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data)
+        // payload should contain 'filename' and 'status' and maybe 'progress'
+        setDownloads((prev) => {
+          // find the entry for this downloadKey (we keep using downloadKey)
+          const existing = prev[downloadKey] || { title: video.title, videoId: video.id }
+          const updated: any = { ...existing, ...payload }
+          // normalize progress when null/undefined
+          if (typeof updated.progress !== 'number' || isNaN(updated.progress)) {
+            updated.progress = updated.progress == null ? updated.progress : Number(updated.progress)
+          }
+          // if finished -> mark complete
+          if (payload.status === 'complete' || payload.status === 'finished') {
+            updated.status = 'complete'
+            // ensure progress is 100
+            updated.progress = 100
+          }
+          return { ...prev, [downloadKey]: updated }
+        })
+
+        if (payload.status === 'complete' || payload.status === 'finished') {
+          // refresh library
+          loadLibrary()
+          // close websocket for this download
+          try { wsRefs.current[downloadKey]?.close() } catch (e) {}
+          delete wsRefs.current[downloadKey]
+          // remove completed downloads after a short delay
+          setTimeout(() => {
+            setDownloads((prev) => {
+              const copy = { ...prev }
+              delete copy[downloadKey]
+              return copy
+            })
+          }, 4000)
+        }
+
+        if (payload.status === 'error') {
+          // keep the error in state for UI
+          setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: payload.error } }))
+          try { wsRefs.current[downloadKey]?.close() } catch (e) {}
+          delete wsRefs.current[downloadKey]
+        }
+      } catch (err) {
+        console.error('WS parse error', err)
+      }
+    }
+
+    ws.onerror = (e) => {
+      setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: 'WebSocket error' } }))
+    }
+
+    ws.onclose = () => {
+      // leave state as-is (complete/error will be handled elsewhere)
+      delete wsRefs.current[downloadKey]
+    }
+  }
+
+  // Cancel all websockets when the page unmounts
+  useEffect(() => {
+    return () => {
+      Object.values(wsRefs.current).forEach((s) => { try { s.close() } catch {} })
+    }
+  }, [])
+
+  // Load trending on mount
+  useEffect(() => {
+    loadTrending()
+    loadLibrary()
+  }, [])
+
+  const loadTrending = async () => {
+    setLoading(true)
+    try {
+      const res = await fetch('/api/trending?XTransformPort=8001')
+      const data = await res.json()
+      setVideos(data.results || [])
+    } catch (err) {
+      console.error('Error loading trending:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loadLibrary = async () => {
+    try {
+      const res = await fetch('/api/library?XTransformPort=8001')
+      const data = await res.json()
+      setLibraryVideos(data.videos || [])
+    } catch (err) {
+      console.error('Error loading library:', err)
+    }
+  }
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!searchQuery.trim()) return
+
+    setLoading(true)
+    setActiveTab('search')
+    try {
+      const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&XTransformPort=8001`)
+      const data = await res.json()
+      setVideos(data.results || [])
+    } catch (err) {
+      console.error('Error searching:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handlePlay = (video: VideoResult | DownloadedVideo) => {
+    const isOffline = 'filename' in video
+    setPlayingVideo(video)
+    setIsOfflinePlay(isOffline)
+    setShowPlayer(true)
+  }
+
+  const handleDownloadClick = (video: VideoResult) => {
+    setDownloadingVideo(video)
+    setShowDownload(true)
+  }
+
+  const handleDownloadComplete = () => {
+    loadLibrary()
+  }
+
+  const handleDeleteVideo = async (filename: string) => {
+    try {
+      await fetch(`/api/library/${filename}?XTransformPort=8001`, { method: 'DELETE' })
+      loadLibrary()
+    } catch (err) {
+      console.error('Error deleting video:', err)
+    }
+  }
+
+  const categories = [
+    { id: '', icon: TrendingUp, label: 'Tendencias' },
+    { id: 'music', icon: Music, label: 'Música' },
+    { id: 'gaming', icon: Gamepad2, label: 'Videojuegos' },
+    { id: 'movies', icon: Film, label: 'Películas' },
+    { id: 'live', icon: Radio, label: 'En vivo' },
+  ]
+
+  return (
+    <div className="min-h-screen bg-background flex">
+      {/* Sidebar */}
+      <aside className={`${sidebarOpen ? 'w-56' : 'w-16'} border-r bg-card flex flex-col transition-all duration-300 fixed h-full z-20`}>
+        <div className="p-3 border-b flex items-center gap-2">
+          <Button variant="ghost" size="icon" onClick={() => setSidebarOpen(!sidebarOpen)}>
+            <Menu className="h-5 w-5" />
+          </Button>
+          {sidebarOpen && (
+            <span className="font-bold text-lg bg-gradient-to-r from-red-600 to-red-500 bg-clip-text text-transparent">
+              OfflineTube
+            </span>
+          )}
+        </div>
+
+        <nav className="flex-1 p-2">
+          <Tabs value={activeTab} onValueChange={setActiveTab} orientation="vertical" className="w-full">
+            <TabsList className="flex flex-col h-auto gap-1 bg-transparent w-full">
+              <TabsTrigger
+                value="home"
+                onClick={() => { setActiveTab('home'); loadTrending() }}
+                className={`w-full justify-start gap-3 px-3 py-2 rounded-lg ${activeTab === 'home' ? 'bg-primary/10 text-primary' : 'hover:bg-muted'}`}
+              >
+                <Home className="h-5 w-5" />
+                {sidebarOpen && <span>Inicio</span>}
+              </TabsTrigger>
+              <TabsTrigger
+                value="library"
+                onClick={() => setActiveTab('library')}
+                className={`w-full justify-start gap-3 px-3 py-2 rounded-lg ${activeTab === 'library' ? 'bg-primary/10 text-primary' : 'hover:bg-muted'}`}
+              >
+                <Library className="h-5 w-5" />
+                {sidebarOpen && <span>Mi Biblioteca</span>}
+                {libraryVideos.length > 0 && (
+                  <Badge variant="secondary" className="ml-auto text-xs">{libraryVideos.length}</Badge>
+                )}
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
+
+          {sidebarOpen && (
+            <>
+              <Separator className="my-3" />
+              <div className="px-2">
+                <p className="text-xs text-muted-foreground mb-2 px-2">Categorías</p>
+                {categories.map((cat) => (
+                  <Button
+                    key={cat.id}
+                    variant={selectedCategory === cat.id ? 'secondary' : 'ghost'}
+                    className="w-full justify-start gap-3 text-sm"
+                    onClick={() => {
+                      setSelectedCategory(cat.id)
+                      // Could filter by category here
+                    }}
+                  >
+                    <cat.icon className="h-4 w-4" />
+                    {cat.label}
+                  </Button>
+                ))}
+              </div>
+            </>
+          )}
+        </nav>
+
+        {sidebarOpen && (
+          <div className="p-3 border-t">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <HardDrive className="h-4 w-4" />
+              <span>{libraryVideos.length} videos offline</span>
+            </div>
+          </div>
+        )}
+      </aside>
+
+      {/* Main Content */}
+      <main className={`flex-1 ${sidebarOpen ? 'ml-56' : 'ml-16'} transition-all duration-300`}>
+        {/* Header */}
+        <header className="sticky top-0 z-10 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 border-b">
+          <div className="p-4 flex items-center gap-4">
+            <form onSubmit={handleSearch} className="flex-1 flex gap-2">
+              <div className="relative flex-1 max-w-2xl">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                <Input
+                  type="search"
+                  placeholder="Buscar videos..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-10 pr-4 py-2 rounded-full"
+                />
+              </div>
+              <Button type="submit" className="rounded-full px-6">
+                Buscar
+              </Button>
+            </form>
+
+            {/* Background downloads indicator (circular) */}
+            {Object.keys(downloads).length > 0 && (
+              <div className="flex items-center gap-3 ml-4">
+                {(() => {
+                  const active = Object.values(downloads).filter(d => ['starting','downloading','processing'].includes(d.status || ''))
+                  const first = active[0]
+                  const percent = typeof first?.progress === 'number' && !isNaN(first.progress) ? Math.min(Math.max(first.progress, 0), 100) : null
+                  return (
+                    <div className="flex items-center gap-2">
+                      <div className="relative w-8 h-8">
+                        {percent == null ? (
+                          <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                        ) : (
+                          <svg className="w-8 h-8" viewBox="0 0 36 36">
+                            <path className="text-muted-foreground" d="M18 2.0845a15.9155 15.9155 0 1 0 0 31.831 15.9155 15.9155 0 1 0 0-31.831" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.15"/>
+                            <path className="text-primary" strokeLinecap="round" strokeWidth="2" fill="none"
+                              strokeDasharray={`${percent}, 100`} d="M18 2.0845a15.9155 15.9155 0 1 0 0 31.831 15.9155 15.9155 0 1 0 0-31.831"/>
+                          </svg>
+                        )}
+                        <div className="absolute inset-0 flex items-center justify-center text-xs font-medium">
+                          {percent == null ? '…' : `${Math.round(percent)}%`}
+                        </div>
+                      </div>
+                      {Object.keys(downloads).length > 1 && (
+                        <Badge className="text-xs">{Object.keys(downloads).length}</Badge>
+                      )}
+                    </div>
+                  )
+                })()}
+              </div>
+            )}
+          </div>
+        </header>
+
+        {/* Content */}
+        <div className="p-4">
+          {(activeTab === 'home' || activeTab === 'search') && (
+            <>
+              <div className="flex items-center justify-between mb-6">
+                <h1 className="text-2xl font-bold">
+                  {searchQuery ? `Resultados: "${searchQuery}"` : 'Videos en Tendencia'}
+                </h1>
+              </div>
+
+              {loading ? (
+                <div className="flex items-center justify-center py-20">
+                  <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                </div>
+              ) : videos.length === 0 ? (
+                <div className="text-center py-20 text-muted-foreground">
+                  <Search className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p>No se encontraron videos</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {videos.map((video) => (
+                    <VideoCard
+                      key={video.id}
+                      video={video}
+                      onPlay={handlePlay}
+                      onDownload={handleDownloadClick}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {activeTab === 'library' && (
+            <>
+              <div className="flex items-center justify-between mb-6">
+                <h1 className="text-2xl font-bold flex items-center gap-2">
+                  <Library className="h-6 w-6" />
+                  Mi Biblioteca
+                </h1>
+                <Badge variant="outline" className="text-sm">
+                  {libraryVideos.length} videos
+                </Badge>
+              </div>
+
+              {libraryVideos.length === 0 ? (
+                <div className="text-center py-20 text-muted-foreground">
+                  <FolderOpen className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p className="text-lg font-medium mb-2">Tu biblioteca está vacía</p>
+                  <p className="text-sm">Descarga videos para verlos sin conexión</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {libraryVideos.map((video) => (
+                    <LibraryVideoCard
+                      key={video.id}
+                      video={video}
+                      onPlay={handlePlay}
+                      onDelete={handleDeleteVideo}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </main>
+
+      {/* Modals */}
+      <PlayerModal
+        video={playingVideo}
+        isOpen={showPlayer}
+        onClose={() => setShowPlayer(false)}
+        isOffline={isOfflinePlay}
+      />
+
+      {(() => {
+        const currentDownload = downloadingVideo ? Object.values(downloads).find(d => d.videoId === downloadingVideo.id) : undefined
+        return (
+          <DownloadModal
+            video={downloadingVideo}
+            isOpen={showDownload}
+            onClose={() => setShowDownload(false)}
+            onDownload={handleDownloadComplete}
+            onPlayOnline={() => {
+              if (downloadingVideo) {
+                handlePlay(downloadingVideo)
+              }
+            }}
+            onStartDownload={(formatId: string, resolution: string) => {
+              if (downloadingVideo) startDownload(downloadingVideo, formatId, resolution)
+            }}
+            downloadProgress={currentDownload}
+          />
+        )
+      })()}
+    </div>
+  )
+}
