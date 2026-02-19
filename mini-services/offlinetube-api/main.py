@@ -6,6 +6,11 @@ import os
 import json
 import re
 import subprocess
+import urllib.request
+import tempfile
+import shutil
+import threading
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -46,6 +51,66 @@ def format_duration(seconds: int) -> str:
     if hours > 0:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+def embed_metadata_into_mp4(filepath: Path, info: Dict[str, Any]):
+    """Embed basic metadata + thumbnail into an mp4/mkv file using ffmpeg (best-effort).
+    Silently falla si ffmpeg no está disponible o hay errores.
+    """
+    try:
+        if not filepath.exists():
+            return
+        suffix = filepath.suffix.lower()
+        if suffix not in ['.mp4', '.m4a', '.mkv', '.mp3']:
+            return
+
+        title = (info.get('title') or '')
+        uploader = (info.get('uploader') or '')
+        webpage = info.get('webpage_url') or info.get('id') or ''
+
+        thumb_url = info.get('thumbnail')
+        thumb_path = None
+        if thumb_url:
+            try:
+                td = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                td.close()
+                urllib.request.urlretrieve(thumb_url, td.name)
+                thumb_path = td.name
+            except Exception as e:
+                print(f"embed: failed to download thumbnail: {e}")
+                thumb_path = None
+
+        tmp_out = filepath.with_suffix(filepath.suffix + '.tmp')
+
+        cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', str(filepath)]
+        meta_args = []
+        if title:
+            meta_args += ['-metadata', f'title={title}']
+        if uploader:
+            meta_args += ['-metadata', f'artist={uploader}']
+        if webpage:
+            meta_args += ['-metadata', f'comment={webpage}']
+
+        if thumb_path:
+            # attach cover art (map streams so we keep original streams and add attached_pic)
+            cmd += ['-i', thumb_path, '-map', '0', '-map', '1']
+            cmd += ['-c', 'copy']
+            cmd += meta_args
+            cmd += ['-disposition:v:1', 'attached_pic', str(tmp_out)]
+        else:
+            cmd += ['-c', 'copy']
+            cmd += meta_args
+            cmd += [str(tmp_out)]
+
+        subprocess.run(cmd, check=True)
+        shutil.move(str(tmp_out), str(filepath))
+        if thumb_path:
+            try:
+                os.unlink(thumb_path)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"embed_metadata_into_mp4 failed for {filepath}: {e}")
 
 # Opciones de yt-dlp optimizadas para evitar bloqueos
 def get_ydl_opts(extract_flat=False):
@@ -170,10 +235,11 @@ async def get_video_info(url: str = Query(..., min_length=1)):
         if not video_id:
             return {"error": "No se pudo extraer el ID del video"}
 
-        # Intentar obtener información con múltiples opciones (probar web primero,
-        # y reintentar con otros clientes si la lista de formatos es muy limitada)
+        # Intentar obtener información con múltiples opciones (probar extracción "por defecto" y varios clientes)
+        # - Primero intentamos una extracción *por defecto* (sin forzar player_client) porque suele devolver la lista más completa
+        # - Luego probamos clientes específicos (web / android / ios) como fallback
         all_opts = [
-            # Cliente web con configuración mínima (mejor para obtener todos los formatos)
+            # Cliente web (intento rápido y fiable para exponer adaptative formats)
             {
                 'quiet': True,
                 'no_warnings': True,
@@ -204,29 +270,53 @@ async def get_video_info(url: str = Query(..., min_length=1)):
                     }
                 },
             },
+            # extracción por defecto (fallback, puede ser más lenta) — se prueba al final
+            {'quiet': True, 'no_warnings': True},
         ]
 
         info = None
+        sanitized_info = None
         last_error = None
+
+        # Try all clients and pick the best candidate (highest available height / most formats)
+        best_candidate = None
+        best_max_height = -1
 
         for opts in all_opts:
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                    candidate = ydl.extract_info(url, download=False)
 
-                    # Si obtuvimos info pero la lista de formatos es muy limitada,
-                    # intentamos con el siguiente cliente para obtener más calidades.
-                    if isinstance(info, dict):
-                        fmts = info.get('formats') or []
-                        if len(fmts) < 2:
-                            info = None
-                            continue
+                    # sanitize candidate info if possible
+                    try:
+                        candidate_sanitized = ydl.sanitize_info(candidate)
+                    except Exception:
+                        candidate_sanitized = candidate
 
-                    if info:
-                        break
+                    if not isinstance(candidate, dict):
+                        continue
+
+                    fmts = candidate.get('formats') or []
+                    if not fmts:
+                        continue
+
+                    # compute the highest height available for this candidate
+                    max_h = max((f.get('height') or 0) for f in fmts)
+
+                    # choose candidate with larger max height, break ties by number of formats
+                    if (max_h > best_max_height) or (max_h == best_max_height and len(fmts) > len((best_candidate[0].get('formats') if best_candidate else []))):
+                        best_candidate = (candidate, candidate_sanitized)
+                        best_max_height = max_h
+
             except Exception as e:
                 last_error = e
                 continue
+
+        if best_candidate:
+            info, sanitized_info = best_candidate
+        else:
+            info = None
+            sanitized_info = None
         
         if not info:
             # Retornar información básica si no podemos obtener formatos
@@ -250,77 +340,67 @@ async def get_video_info(url: str = Query(..., min_length=1)):
                 'can_play_online': True,
             }
         
-        # Filtrar formatos de video
-        video_formats = []
-        seen_resolutions = set()
-        
-        for fmt in info.get('formats', []):
-            height = fmt.get('height')
-            if height and fmt.get('vcodec') != 'none':
-                if height not in seen_resolutions:
-                    seen_resolutions.add(height)
-                    filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                    video_formats.append({
-                        'format_id': fmt.get('format_id', ''),
-                        'ext': fmt.get('ext', 'mp4'),
-                        'resolution': f"{fmt.get('width', 0)}x{height}",
-                        'height': height,
-                        'fps': fmt.get('fps', 0) or 0,
-                        'filesize': filesize,
-                        'filesize_formatted': format_filesize(filesize),
-                        'vcodec': fmt.get('vcodec', ''),
-                        'acodec': fmt.get('acodec', 'none'),
-                        'has_audio': fmt.get('acodec') != 'none' and fmt.get('acodec') is not None,
-                    })
-        
-        # Si no hay formatos, agregar opciones por defecto
-        if not video_formats:
-            video_formats = [
-                {'format_id': 'best', 'ext': 'mp4', 'resolution': 'Mejor calidad', 'height': 1080, 'fps': 30, 'filesize': 0, 'filesize_formatted': 'N/A', 'vcodec': 'h264', 'acodec': 'aac', 'has_audio': True},
-                {'format_id': 'best[height<=720]', 'ext': 'mp4', 'resolution': '720p', 'height': 720, 'fps': 30, 'filesize': 0, 'filesize_formatted': 'N/A', 'vcodec': 'h264', 'acodec': 'aac', 'has_audio': True},
-                {'format_id': 'best[height<=480]', 'ext': 'mp4', 'resolution': '480p', 'height': 480, 'fps': 30, 'filesize': 0, 'filesize_formatted': 'N/A', 'vcodec': 'h264', 'acodec': 'aac', 'has_audio': True},
-            ]
-        else:
-            # Añadir calidades estándar si faltan (para que la UI siempre muestre opciones)
-            existing_heights = {vf.get('height') for vf in video_formats if vf.get('height')}
-            standard_heights = [1080, 720, 480, 360]
-            for h in standard_heights:
-                if h not in existing_heights:
-                    video_formats.append({
-                        'format_id': f'best[height<={h}]',
-                        'ext': 'mp4',
-                        'resolution': f'{h}p',
-                        'height': h,
-                        'fps': 30,
-                        'filesize': 0,
-                        'filesize_formatted': 'N/A',
-                        'vcodec': 'h264',
-                        'acodec': 'aac',
-                        'has_audio': True,
-                    })
+        # Construir lista completa de formatos (video, audio y combinados) exponiendo `format_id` real
+        # Preferir la lista 'sanitizada' si está disponible — usarla como fuente única para generar el listado que devolveremos
+        full_formats_list = (sanitized_info.get('formats') if sanitized_info else (info.get('formats') if isinstance(info, dict) else []))
+        formats = []
+        seen_ids = set()
+        for fmt in (full_formats_list or []):
+            fid = fmt.get('format_id') or ''
+            if not fid or fid in seen_ids:
+                continue
+            seen_ids.add(fid)
+            has_video = fmt.get('vcodec') and fmt.get('vcodec') != 'none'
+            has_audio = fmt.get('acodec') and fmt.get('acodec') != 'none'
+            filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
+            formats.append({
+                'format_id': fid,
+                'format': fmt.get('format'),
+                'format_note': fmt.get('format_note') or '',
+                'ext': fmt.get('ext') or '',
+                'protocol': fmt.get('protocol') or '',
+                'height': fmt.get('height'),
+                'width': fmt.get('width'),
+                'fps': fmt.get('fps') or 0,
+                'filesize': filesize,
+                'filesize_formatted': format_filesize(filesize),
+                'vcodec': fmt.get('vcodec'),
+                'acodec': fmt.get('acodec'),
+                'has_audio': has_audio,
+                'has_video': has_video,
+                'resolution': f"{fmt.get('height')}p" if fmt.get('height') else (fmt.get('format_note') or fmt.get('ext') or 'audio'),
+            })
 
-            # Ordenar por resolución descendente y eliminar duplicados por format_id
-            video_formats.sort(key=lambda x: -x['height'])
-            seen_ids = set()
-            deduped = []
-            for vf in video_formats:
-                fid = vf.get('format_id')
-                if fid in seen_ids:
-                    continue
-                seen_ids.add(fid)
-                deduped.append(vf)
-            video_formats = deduped[:8]
+        # Ordenar: combinados (video+audio) primero por altura, luego video-only, luego audio-only
+        formats.sort(key=lambda f: (
+            0 if (f['has_video'] and f['has_audio']) else (1 if f['has_video'] else 2),
+            -(f.get('height') or 0),
+            -(f.get('filesize') or 0)
+        ))
+
+        # Para compatibilidad con la UI antigua, también verificamos que haya formatos con video disponibles
+        # (no limitamos la cantidad — devolvemos todos los formatos encontrados)
+        video_formats = [f for f in formats if f['has_video']]
+        if not video_formats:
+            # fallback sintético (como antes)
+            video_formats = [
+                {'format_id': 'best', 'ext': 'mp4', 'resolution': 'Mejor calidad', 'height': 1080, 'fps': 30, 'filesize': 0, 'filesize_formatted': 'N/A', 'vcodec': 'h264', 'acodec': 'aac', 'has_audio': True, 'has_video': True},
+                {'format_id': 'best[height<=720]', 'ext': 'mp4', 'resolution': '720p', 'height': 720, 'fps': 30, 'filesize': 0, 'filesize_formatted': 'N/A', 'vcodec': 'h264', 'acodec': 'aac', 'has_audio': True, 'has_video': True},
+                {'format_id': 'best[height<=480]', 'ext': 'mp4', 'resolution': '480p', 'height': 480, 'fps': 30, 'filesize': 0, 'filesize_formatted': 'N/A', 'vcodec': 'h264', 'acodec': 'aac', 'has_audio': True, 'has_video': True},
+            ]
         
         return {
             'id': video_id,
             'title': info.get('title', 'Sin título'),
-            'description': (info.get('description', '') or '')[:500],
+            'description': (info.get('description', '') or '')[:2000],
             'thumbnail': f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
             'duration': info.get('duration', 0) or 0,
             'duration_formatted': format_duration(info.get('duration', 0)),
             'uploader': info.get('uploader', 'Desconocido'),
             'view_count': info.get('view_count', 0) or 0,
-            'formats': video_formats,
+            'formats': formats,
+            # full, sanitized formats (raw) to allow the UI to display everything
+            'raw_formats': (sanitized_info.get('formats') if sanitized_info else info.get('formats') if isinstance(info, dict) else []),
             'url': url,
             'can_play_online': True,
         }
@@ -365,11 +445,79 @@ async def get_video_info(url: str = Query(..., min_length=1)):
         print(f"Video info error: {e}")
         return {"error": str(e)}
 
+@app.get("/api/playlist/info")
+async def get_playlist_info(url: str = Query(..., min_length=1)):
+    """Obtiene la lista de entradas de una playlist (rápido - extract_flat)"""
+    try:
+        # si la URL contiene `list=` y además `watch?v=`, forzar la URL tipo /playlist?list=ID
+        list_match = None
+        m = re.search(r'[?&]list=([a-zA-Z0-9_-]+)', url)
+        if m:
+            list_match = m.group(1)
+
+        playlist_url = url
+        if list_match:
+            playlist_url = f"https://www.youtube.com/playlist?list={list_match}"
+
+        # intentar múltiples configuraciones de extractor (web/android/ios) para mejorar chances
+        all_opts = [
+            get_ydl_opts(extract_flat=True),
+            {**get_ydl_opts(extract_flat=True), 'extractor_args': {'youtube': {'player_client': ['web']}}},
+            {**get_ydl_opts(extract_flat=True), 'extractor_args': {'youtube': {'player_client': ['android']}}},
+            {**get_ydl_opts(extract_flat=True), 'extractor_args': {'youtube': {'player_client': ['ios']}}},
+        ]
+
+        info = None
+        for opts in all_opts:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    candidate = ydl.extract_info(playlist_url, download=False)
+                    if candidate and isinstance(candidate, dict) and candidate.get('entries'):
+                        info = candidate
+                        break
+            except Exception:
+                continue
+
+        if not info:
+            # último intento con opciones por defecto
+            with yt_dlp.YoutubeDL(get_ydl_opts(extract_flat=True)) as ydl:
+                info = ydl.extract_info(playlist_url, download=False)
+
+            # Normalizar entradas de playlist
+            entries = []
+            for e in info.get('entries') or []:
+                if not e:
+                    continue
+                vid = e.get('id') or e.get('url') or None
+                if not vid:
+                    continue
+                entries.append({
+                    'id': vid,
+                    'title': e.get('title') or f'Video {vid}',
+                    'thumbnail': e.get('thumbnail') or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                    'duration': e.get('duration') or 0,
+                    'duration_formatted': format_duration(e.get('duration') or 0),
+                    'uploader': e.get('uploader') or e.get('uploader_id') or '',
+                    'url': f"https://www.youtube.com/watch?v={vid}"
+                })
+
+            return {
+                'id': info.get('id'),
+                'title': info.get('title') or 'Playlist',
+                'uploader': info.get('uploader') or '',
+                'count': len(entries),
+                'entries': entries
+            }
+    except Exception as e:
+        print(f"Playlist info error: {e}")
+        return {"error": str(e)}
+
 @app.get("/api/video/download")
 async def download_video(
     url: str = Query(..., min_length=1),
     format_id: str = Query(None),
-    resolution: str = Query("720")
+    resolution: str = Query("720"),
+    use_ffmpeg: bool = Query(False)
 ):
     """Descarga un video"""
     try:
@@ -389,41 +537,93 @@ async def download_video(
             video_id = info.get('id', '')
             title = info.get('title', 'video')
             
-            safe_title = re.sub(r'[^\w\s-]', '', title)[:50]
+            # keep full title in metadata sidecar but use a filesystem-friendly filename (longer allowed)
+            safe_title = re.sub(r'[^\w\s-]', '', title)[:120]
             safe_title = re.sub(r'[-\s]+', '_', safe_title)
+
+            # Save metadata sidecar so offline library shows full metadata
+            try:
+                meta = {
+                    'id': video_id,
+                    'title': info.get('title'),
+                    'description': info.get('description') or '',
+                    'thumbnail': f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                    'duration': info.get('duration', 0) or 0,
+                    'duration_formatted': format_duration(info.get('duration', 0)),
+                    'uploader': info.get('uploader') or info.get('channel') or 'Desconocido',
+                    'view_count': info.get('view_count', 0) or 0,
+                    'tags': info.get('tags') or [],
+                    'formats': [
+                        {
+                            'format_id': f.get('format_id'),
+                            'ext': f.get('ext'),
+                            'resolution': f"{f.get('width', 0)}x{f.get('height')}" if f.get('height') else 'N/A',
+                            'height': f.get('height'),
+                            'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                            'filesize_formatted': format_filesize(f.get('filesize') or f.get('filesize_approx', 0) or 0),
+                            'vcodec': f.get('vcodec'),
+                            'acodec': f.get('acodec'),
+                        }
+                        for f in (info.get('formats') or [])
+                    ]
+                }
+                with open(DOWNLOAD_DIR / f"{safe_title}_{video_id}.json", 'w', encoding='utf-8') as mf:
+                    json.dump(meta, mf, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"Failed to write metadata sidecar: {e}")
             
-            if format_id and format_id != 'best' and not format_id.startswith('best['):
-                format_spec = format_id + "+bestaudio/best"
+            # Determine format_spec: if a format_id was provided, prefer it; if it's a video-only format, append bestaudio
+            if format_id:
+                if '+' in format_id or format_id.startswith('best') or '[' in format_id:
+                    format_spec = format_id
+                else:
+                    # inspect available formats to decide whether to add audio
+                    sel = next((f for f in (info.get('formats') or []) if f.get('format_id') == format_id), None)
+                    if sel and (sel.get('acodec') in (None, 'none')):
+                        format_spec = f"{format_id}+bestaudio/best"
+                    else:
+                        format_spec = format_id
             else:
                 format_spec = f"best[height<={resolution}]+bestaudio/best[height<={resolution}]/best"
-            
+
             output_path = DOWNLOAD_DIR / f"{safe_title}_{video_id}.%(ext)s"
-            
+
             ydl_opts_download = {
                 'quiet': False,
                 'no_warnings': False,
                 'format': format_spec,
                 'outtmpl': str(output_path),
                 'merge_output_format': 'mp4',
+                'progress_hooks': [],
                 'extractor_args': {
                     'youtube': {
                         'player_client': ['android', 'ios', 'web'],
                     }
                 },
             }
-            
+
+            if use_ffmpeg:
+                ydl_opts_download['writeinfojson'] = True
+                ydl_opts_download['writethumbnail'] = True
+                ydl_opts_download['writesubtitles'] = True
+                ydl_opts_download['writeautomaticsub'] = True
+
             with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_download:
                 ydl_download.download([url])
-            
+
+            # try to embed metadata/thumbnail into output file (best-effort) when requested
             for file in DOWNLOAD_DIR.glob(f"{safe_title}_{video_id}.*"):
                 if file.is_file():
-                    return {
-                        'success': True,
-                        'filename': file.name,
-                        'filepath': str(file),
-                        'size': file.stat().st_size
-                    }
-            
+                    # attempt to embed metadata/thumbnail via ffmpeg if requested
+                    if use_ffmpeg:
+                        try:
+                            embed_metadata_into_mp4(file, info)
+                        except Exception:
+                            pass
+
+                    return {'success': True, 'filename': file.name, 'size': file.stat().st_size}
+
+            # if we reach here, the expected output file wasn't found
             return {'success': False, 'error': 'Archivo no encontrado'}
     
     except Exception as e:
@@ -442,15 +642,30 @@ async def get_library():
             if file.is_file() and file.suffix in ['.mp4', '.webm', '.mkv', '.mp3', '.m4a']:
                 video_id_match = re.search(r'_([a-zA-Z0-9_-]{11})\.', file.name)
                 video_id = video_id_match.group(1) if video_id_match else file.stem
+
+                # try to load metadata sidecar JSON if exists
+                meta = {}
+                try:
+                    sidecar = DOWNLOAD_DIR / (file.stem + '.json')
+                    if sidecar.exists():
+                        with open(sidecar, 'r', encoding='utf-8') as sf:
+                            meta = json.load(sf)
+                except Exception as e:
+                    print(f"Failed to read metadata sidecar for {file.name}: {e}")
                 
                 videos.append({
-                    'id': video_id,
-                    'title': file.stem.replace('_', ' '),
+                    'id': meta.get('id', video_id),
+                    'title': meta.get('title') or file.stem.replace('_', ' '),
+                    'description': meta.get('description', ''),
                     'filename': file.name,
                     'filepath': str(file),
-                    'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if len(video_id) == 11 else '',
-                    'duration': 0,
-                    'resolution': 'N/A',
+                    'thumbnail': meta.get('thumbnail') or (f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if len(video_id) == 11 else ''),
+                    'duration': meta.get('duration', 0),
+                    'duration_formatted': meta.get('duration_formatted', format_duration(meta.get('duration', 0))),
+                    'uploader': meta.get('uploader', 'Desconocido'),
+                    'view_count': meta.get('view_count', 0),
+                    'formats': meta.get('formats', []),
+                    'resolution': meta.get('formats', [{}])[0].get('height') or 'N/A',
                     'size': file.stat().st_size,
                     'size_formatted': format_filesize(file.stat().st_size),
                     'downloaded_at': datetime.fromtimestamp(file.stat().st_mtime).isoformat()
@@ -530,12 +745,23 @@ async def websocket_download(websocket: WebSocket):
                         max_height = max(available_heights) if available_heights else 0
 
                         try:
-                            requested_height = int(resolution)
+                            requested_height = int(resolution) if str(resolution).isdigit() else 0
                         except Exception:
                             requested_height = 0
+                        # accept explicit format_id from client (so UI selection is respected)
+                        requested_format = message.get('format_id')
 
-                        # if requested resolution isn't available, notify client and use the highest available
+                        # determine resolution_to_use default
                         resolution_to_use = requested_height
+
+                        if requested_format:
+                            # try to find selected format in extracted info
+                            sel = next((f for f in (info.get('formats') or []) if f.get('format_id') == requested_format), None)
+                            if sel:
+                                # if the selected format is video-only, note it; we will add bestaudio when building fmt_spec
+                                if sel.get('height'):
+                                    resolution_to_use = sel.get('height')
+
                         if requested_height and max_height and requested_height > max_height:
                             await websocket.send_json({
                                 'status': 'info',
@@ -544,15 +770,160 @@ async def websocket_download(websocket: WebSocket):
                             })
                             resolution_to_use = max_height
 
-                        # initial status — progress unknown until yt-dlp reports totals
-                        await websocket.send_json({
+                        # try to estimate total bytes from the extracted `info` (filesize / filesize_approx)
+                        estimated_total = None
+
+                        def _filesize_of(fmt):
+                            return fmt.get('filesize') or fmt.get('filesize_approx') or None
+
+                        # helper to find bestaudio/video candidates
+                        formats_list = info.get('formats') or []
+
+                        if requested_format:
+                            # cases: explicit id(s), compound specs, or 'best[...]' patterns
+                            if '+' in requested_format:
+                                # requested like '137+140' -> sum known sizes for each id when available
+                                parts = [p for p in requested_format.split('+') if p]
+                                total_sum = 0
+                                found_any = False
+                                for pid in parts:
+                                    sel = next((f for f in formats_list if f.get('format_id') == pid), None)
+                                    if sel:
+                                        fs = _filesize_of(sel)
+                                        if fs:
+                                            total_sum += fs
+                                            found_any = True
+                                if found_any:
+                                    estimated_total = total_sum
+                            elif requested_format.startswith('best') or '[' in requested_format:
+                                # pattern-based: estimate by selecting best video <= resolution + bestaudio
+                                # video candidate
+                                v_cand = None
+                                for f in sorted(formats_list, key=lambda x: (x.get('height') or 0), reverse=True):
+                                    if f.get('vcodec') and f.get('vcodec') != 'none' and (not f.get('acodec') or f.get('acodec') == 'none'):
+                                        if resolution_to_use and f.get('height') and f.get('height') <= resolution_to_use:
+                                            v_cand = f
+                                            break
+                                # audio candidate (best available)
+                                a_cand = next((f for f in sorted(formats_list, key=lambda x: x.get('abr') or 0, reverse=True) if not f.get('vcodec') or f.get('vcodec') == 'none'), None)
+                                sizes = []
+                                if v_cand:
+                                    fs = _filesize_of(v_cand)
+                                    if fs:
+                                        sizes.append(fs)
+                                if a_cand:
+                                    fs = _filesize_of(a_cand)
+                                    if fs:
+                                        sizes.append(fs)
+                                if sizes:
+                                    estimated_total = sum(sizes)
+                            else:
+                                # single format id
+                                sel = next((f for f in formats_list if f.get('format_id') == requested_format), None)
+                                if sel:
+                                    fs = _filesize_of(sel)
+                                    if fs:
+                                        # if sel is video-only, try to add audio estimate
+                                        if sel.get('acodec') in (None, 'none'):
+                                            a = next((f for f in formats_list if (not f.get('vcodec') or f.get('vcodec') == 'none')), None)
+                                            a_fs = _filesize_of(a) if a else None
+                                            estimated_total = fs + (a_fs or 0) if fs else (a_fs or None)
+                                        else:
+                                            estimated_total = fs
+                        else:
+                            # no explicit format -> try to find a combined format or best video+audio pair
+                            combined = next((f for f in sorted(formats_list, key=lambda x: (x.get('height') or 0), reverse=True) if f.get('vcodec') and f.get('acodec') and ((not resolution_to_use) or (f.get('height') or 0) <= resolution_to_use)), None)
+                            if combined:
+                                fs = _filesize_of(combined)
+                                if fs:
+                                    estimated_total = fs
+                            else:
+                                # fallback: best video (<= resolution) + best audio
+                                v_cand = next((f for f in sorted(formats_list, key=lambda x: (x.get('height') or 0), reverse=True) if f.get('vcodec') and (not resolution_to_use or (f.get('height') or 0) <= resolution_to_use)), None)
+                                a_cand = next((f for f in sorted(formats_list, key=lambda x: x.get('abr') or 0, reverse=True) if not f.get('vcodec') or f.get('vcodec') == 'none'), None)
+                                sizes = []
+                                if v_cand:
+                                    fs = _filesize_of(v_cand)
+                                    if fs:
+                                        sizes.append(fs)
+                                if a_cand:
+                                    fs = _filesize_of(a_cand)
+                                    if fs:
+                                        sizes.append(fs)
+                                if sizes:
+                                    estimated_total = sum(sizes)
+
+                        # initial status — include any filesize estimate we computed so UI can show % immediately
+                        initial_payload = {
                             'status': 'downloading',
                             'progress': None,
                             'speed': 'N/A',
                             'eta': 'N/A',
                             'filename': f"{safe_title}_{video_id}.mp4",
-                            'requested_height': requested_height if requested_height else None
-                        })
+                            'requested_height': requested_height if requested_height else None,
+                            'requested_format_id': requested_format if requested_format else None,
+                            'downloaded_bytes': 0
+                        }
+
+                        if estimated_total:
+                            initial_payload['total_bytes'] = int(estimated_total)
+
+                        await websocket.send_json(initial_payload)
+
+                        # --- Start a background poller that watches the output file size as a fallback ---
+                        stop_poller = threading.Event()
+                        base_name = f"{safe_title}_{video_id}"
+
+                        def _poll_output_file(poll_interval=0.5):
+                            last_size = 0
+                            last_time = time.time()
+                            while not stop_poller.is_set():
+                                try:
+                                    matches = list(DOWNLOAD_DIR.glob(f"{base_name}.*"))
+                                    size = 0
+                                    if matches:
+                                        size = max((m.stat().st_size for m in matches if m.is_file()), default=0)
+
+                                    now = time.time()
+                                    if size != last_size:
+                                        # estimate speed from file growth
+                                        delta = now - last_time if last_time else 1.0
+                                        speed = int((size - last_size) / delta) if delta > 0 else None
+
+                                        # compute ETA when we have an estimated_total
+                                        eta_str = 'N/A'
+                                        if estimated_total and speed and speed > 0:
+                                            rem = max(0, int(estimated_total) - size)
+                                            eta_seconds = int(rem / speed)
+                                            eta_str = f"{eta_seconds}s"
+
+                                        payload = {
+                                            'status': 'downloading',
+                                            'downloaded_bytes': size,
+                                            'total_bytes': int(estimated_total) if estimated_total else None,
+                                            'speed_bps': speed,
+                                            'speed': (format_filesize(speed) + '/s') if speed else 'N/A',
+                                            'eta': eta_str,
+                                            'filename': f"{base_name}.mp4"
+                                        }
+
+                                        try:
+                                            loop = __import__('asyncio').get_event_loop()
+                                            loop.call_soon_threadsafe(
+                                                lambda: __import__('asyncio').create_task(websocket.send_json(payload))
+                                            )
+                                        except Exception:
+                                            pass
+
+                                        last_size = size
+                                        last_time = now
+                                except Exception:
+                                    pass
+
+                                time.sleep(poll_interval)
+
+                        poller_thread = threading.Thread(target=_poll_output_file, daemon=True)
+                        poller_thread.start()
 
                         def progress_hook(d):
                             import asyncio
@@ -578,17 +949,24 @@ async def websocket_download(websocket: WebSocket):
                                 pass
 
                             if d['status'] == 'downloading':
-                                total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                                total = d.get('total_bytes') or d.get('total_bytes_estimate') or None
                                 downloaded = d.get('downloaded_bytes', 0)
 
                                 # avoid division by zero; if total is 0 use None to indicate unknown
                                 progress = (downloaded / total * 100) if total else None
 
+                                speed_bps = d.get('speed') or None
+
                                 payload = {
                                     'status': 'downloading',
-                                    # keep `progress` as None when unknown so the UI shows an indeterminate state
-                                    'progress': progress,
-                                    'speed': format_filesize(d.get('speed', 0)) + '/s',
+                                    # numeric percentage (0-100) when total known; otherwise None
+                                    'progress': round(progress, 2) if isinstance(progress, float) else progress,
+                                    # raw byte counts for the UI to compute an exact percentage if desired
+                                    'downloaded_bytes': downloaded,
+                                    'total_bytes': total,
+                                    # numeric speed in bytes/sec (may be None) + human string for backwards compatibility
+                                    'speed_bps': speed_bps,
+                                    'speed': (format_filesize(speed_bps) + '/s') if speed_bps else 'N/A',
                                     'eta': str(d.get('eta', 'N/A')) + 's',
                                     'filename': f"{safe_title}_{video_id}.mp4",
                                     'selected_format_id': selected_format_id,
@@ -604,6 +982,11 @@ async def websocket_download(websocket: WebSocket):
                                     print(f"WS: failed to send progress payload: {e}")
 
                             elif d['status'] == 'finished':
+                                # stop the file poller (if running) — progress_hook runs in yt-dlp thread
+                                try:
+                                    stop_poller.set()
+                                except Exception:
+                                    pass
                                 try:
                                     loop = asyncio.get_event_loop()
                                     loop.call_soon_threadsafe(
@@ -620,8 +1003,21 @@ async def websocket_download(websocket: WebSocket):
 
                         output_path = DOWNLOAD_DIR / f"{safe_title}_{video_id}.%(ext)s"
 
-                        # use resolution_to_use determined earlier
-                        fmt_spec = f'best[height<={resolution_to_use}]' + '+bestaudio/best' if resolution_to_use else 'best'
+                        # build format spec using requested_format (if provided) or resolution_to_use
+                        requested_format = message.get('format_id')
+                        use_ffmpeg = bool(message.get('use_ffmpeg', False))
+
+                        if requested_format:
+                            if '+' in requested_format or requested_format.startswith('best') or '[' in requested_format:
+                                fmt_spec = requested_format
+                            else:
+                                sel = next((f for f in (info.get('formats') or []) if f.get('format_id') == requested_format), None)
+                                if sel and (sel.get('acodec') in (None, 'none')):
+                                    fmt_spec = f"{requested_format}+bestaudio/best"
+                                else:
+                                    fmt_spec = requested_format
+                        else:
+                            fmt_spec = (f'best[height<={resolution_to_use}]'+ '+bestaudio/best') if resolution_to_use else 'best'
 
                         ydl_opts_download = {
                             'quiet': False,
@@ -637,17 +1033,99 @@ async def websocket_download(websocket: WebSocket):
                             },
                         }
 
-                        with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_download:
-                            ydl_download.download([url])
+                        # enable extra postprocessing/embed options when user requests ffmpeg assistance
+                        if use_ffmpeg:
+                            ydl_opts_download['writeinfojson'] = True
+                            ydl_opts_download['writethumbnail'] = True
+                            # request subtitles when possible (yt-dlp will ignore unsupported flags)
+                            ydl_opts_download['writesubtitles'] = True
+                            ydl_opts_download['writeautomaticsub'] = True
+
+                        try:
+                            # log the chosen format spec for debugging
+                            try:
+                                print(f"WS: download fmt_spec -> {fmt_spec}")
+                            except Exception:
+                                pass
+
+                            with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_download:
+                                ydl_download.download([url])
+                        except Exception as download_exc:
+                            # If yt-dlp complains about requested format not being available,
+                            # retry using a resolution-based spec (best[height<=requested]+bestaudio/best)
+                            err_str = str(download_exc)
+                            print(f"WS: download failed -> {err_str}")
+                            if 'Requested format is not available' in err_str or 'requested format is not available' in err_str.lower():
+                                try:
+                                    # build a resolution-based fallback fmt_spec
+                                    if resolution_to_use:
+                                        fallback_spec = f"best[height<={resolution_to_use}]+bestaudio/best"
+                                    else:
+                                        fallback_spec = 'best'
+
+                                    print(f"WS: retrying with fallback fmt_spec -> {fallback_spec}")
+                                    ydl_opts_download['format'] = fallback_spec
+                                    with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_download:
+                                        ydl_download.download([url])
+                                except Exception as retry_exc:
+                                    print(f"WS: retry failed -> {retry_exc}")
+                                    raise
+                            else:
+                                raise
+                        finally:
+                            try:
+                                stop_poller.set()
+                            except Exception:
+                                pass
+
+                        # write metadata sidecar for offline library
+                        try:
+                            meta = {
+                                'id': video_id,
+                                'title': info.get('title'),
+                                'description': info.get('description') or '',
+                                'thumbnail': f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                                'duration': info.get('duration', 0) or 0,
+                                'duration_formatted': format_duration(info.get('duration', 0)),
+                                'uploader': info.get('uploader') or info.get('channel') or 'Desconocido',
+                                'view_count': info.get('view_count', 0) or 0,
+                                'formats': [
+                                    {
+                                        'format_id': f.get('format_id'),
+                                        'ext': f.get('ext'),
+                                        'resolution': f"{f.get('width', 0)}x{f.get('height')}" if f.get('height') else 'N/A',
+                                        'height': f.get('height'),
+                                        'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                                        'filesize_formatted': format_filesize(f.get('filesize') or f.get('filesize_approx', 0) or 0),
+                                        'vcodec': f.get('vcodec'),
+                                        'acodec': f.get('acodec'),
+                                    }
+                                    for f in (info.get('formats') or [])
+                                ]
+                            }
+                            with open(DOWNLOAD_DIR / f"{safe_title}_{video_id}.json", 'w', encoding='utf-8') as mf:
+                                json.dump(meta, mf, ensure_ascii=False, indent=2)
+                        except Exception as e:
+                            print(f"Failed to write metadata sidecar (ws): {e}")
 
                         for file in DOWNLOAD_DIR.glob(f"{safe_title}_{video_id}.*"):
                             if file.is_file():
+                                # attempt to embed metadata/thumbnail via ffmpeg if requested
+                                if use_ffmpeg:
+                                    try:
+                                        embed_metadata_into_mp4(file, info)
+                                    except Exception as e:
+                                        print(f"embed failed (ws): {e}")
+
                                 await websocket.send_json({
                                     'status': 'complete',
                                     'progress': 100,
                                     'filename': file.name,
                                     'filepath': str(file),
                                     'size': file.stat().st_size,
+                                    'downloaded_bytes': file.stat().st_size,
+                                    'total_bytes': file.stat().st_size,
+                                    'speed_bps': None,
                                     'selected_height': selected_height if 'selected_height' in locals() else None,
                                     'selected_format_id': selected_format_id if 'selected_format_id' in locals() else None
                                 })

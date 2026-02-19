@@ -1,0 +1,6 @@
+
+> offlinetube-api@1.0.0 dev
+> uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+INFO:     Will watch for changes in these directories: ['/home/mrmontero/Descargas/workspace-f58005e9-bf38-445b-9059-64a603512b02 (1)/mini-services/offlinetube-api']
+ERROR:    [Errno 98] Address already in use

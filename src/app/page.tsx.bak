@@ -95,25 +95,6 @@ interface VideoInfo {
   url: string
 }
 
-// Playlist types
-interface PlaylistEntry {
-  id: string
-  title: string
-  thumbnail: string
-  duration: number
-  duration_formatted: string
-  uploader?: string
-  url: string
-}
-
-interface PlaylistInfo {
-  id?: string | null
-  title: string
-  uploader?: string
-  count: number
-  entries: PlaylistEntry[]
-}
-
 interface DownloadedVideo {
   id: string
   title: string
@@ -137,15 +118,6 @@ interface DownloadProgress {
   selected_format_id?: string
   selected_height?: number | null
   requested_resolution?: number | null
-  // new numeric fields provided by backend/ws
-  downloaded_bytes?: number | null
-  total_bytes?: number | null
-  speed_bps?: number | null
-
-  // client-side fields for better UX
-  started_at?: number // ms since epoch when we initiated the download (set by client)
-  elapsed_seconds?: number // computed when download completes
-  avg_speed_bps?: number | null // average speed computed on completion
 }
 
 // Utility functions
@@ -169,44 +141,6 @@ function formatViews(views: number): string {
     return `${(views / 1000).toFixed(1)}K views`
   }
   return `${views} views`
-}
-
-// Human-friendly filesize formatter used by the UI
-function formatFileSize(bytes?: number | null): string {
-  if (!bytes && bytes !== 0) return 'N/A'
-  const b = Number(bytes || 0)
-  if (b === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let value = b
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024
-    i++
-  }
-  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[i]}`
-}
-
-// Compute ETA string from ws payload (prefer explicit eta if parseable, otherwise compute from bytes/speed)
-function computeEta(dp?: DownloadProgress | null): string {
-  if (!dp) return 'N/A'
-
-  // if backend sent a numeric-ish eta (like '123s'), parse it
-  if (dp.eta && typeof dp.eta === 'string') {
-    const m = dp.eta.match(/^(\d+)\s*s?$/)
-    if (m) {
-      const secs = Number(m[1])
-      if (!isNaN(secs)) return formatDuration(secs)
-    }
-  }
-
-  // prefer client-side calculation when speed and sizes available
-  if (dp.downloaded_bytes != null && dp.total_bytes != null && dp.speed_bps && dp.speed_bps > 0) {
-    const rem = Math.max(0, Number(dp.total_bytes) - Number(dp.downloaded_bytes))
-    const secs = Math.ceil(rem / Number(dp.speed_bps))
-    return formatDuration(secs)
-  }
-
-  return 'N/A'
 }
 
 // Components
@@ -384,27 +318,6 @@ function DownloadModal({ video, isOpen, onClose, onDownload, onPlayOnline, onSta
   const [selectedFormat, setSelectedFormat] = useState<string>('')
   const [forceMergeWithFFmpeg, setForceMergeWithFFmpeg] = useState<boolean>(true)
   const [showFormatDetails, setShowFormatDetails] = useState<boolean>(false)
-  const [showAllFormats, setShowAllFormats] = useState<boolean>(false)
-
-
-
-  // computed display progress: only use numeric percentage when backend provides it
-  // otherwise `displayProgress` is null -> UI shows indeterminate state and bytes/speed
-  const displayProgress: number | null = (downloadProgress && typeof downloadProgress.progress === 'number' && !isNaN(downloadProgress.progress))
-    ? Math.min(Math.max(downloadProgress.progress, 0), 100)
-    : null
-
-  useEffect(() => {
-    // cuando el usuario activa "Mostrar todos los formatos", asegurarnos de que
-    // `selectedFormat` apunte a un `format_id` presente en `raw_formats` para evitar selects vacíos
-    if (!videoInfo) return
-    if (showAllFormats && videoInfo.raw_formats) {
-      const ids = (videoInfo.raw_formats || []).map((f: any) => f.format_id)
-      if (ids.length > 0 && !ids.includes(selectedFormat)) {
-        setSelectedFormat(ids[0])
-      }
-    }
-  }, [showAllFormats, videoInfo])
 
   useEffect(() => {
     if (!isOpen || !video) return
@@ -541,19 +454,11 @@ function DownloadModal({ video, isOpen, onClose, onDownload, onPlayOnline, onSta
 
                 {/* Synthetic / fallback quality options (useful when extractor doesn't list adaptive formats) */}
                 <div className="px-3 py-2 text-xs text-muted-foreground">Opciones adicionales</div>
-                {(() => {
-                  const allForMax = (showAllFormats && videoInfo.raw_formats) ? videoInfo.raw_formats : videoInfo.formats
-                  const maxH = Math.max(...(allForMax.map((f: any) => f.height || 0)));
-                  return (
-                    <>
-                      <SelectItem value="best">Mejor calidad disponible (best)</SelectItem>
-                      <SelectItem value="best[height<=2160]" disabled={maxH < 2160}>{`2160p ${maxH < 2160 ? '(no disponible)' : '(si está disponible)'}`}</SelectItem>
-                      <SelectItem value="best[height<=1440]" disabled={maxH < 1440}>{`1440p ${maxH < 1440 ? '(no disponible)' : '(si está disponible)'}`}</SelectItem>
-                      <SelectItem value="best[height<=1080]" disabled={maxH < 1080}>{`1080p ${maxH < 1080 ? '(no disponible)' : '(si está disponible)'}`}</SelectItem>
-                      <SelectItem value="best[height<=720]" disabled={maxH < 720}>{`720p ${maxH < 720 ? '(no disponible)' : '(si está disponible)'}`}</SelectItem>
-                    </>
-                  )
-                })()}
+                <SelectItem value="best">Mejor calidad disponible (best)</SelectItem>
+                <SelectItem value="best[height<=2160]">2160p (si está disponible)</SelectItem>
+                <SelectItem value="best[height<=1440]">1440p (si está disponible)</SelectItem>
+                <SelectItem value="best[height<=1080]">1080p (si está disponible)</SelectItem>
+                <SelectItem value="best[height<=720]">720p (si está disponible)</SelectItem>
               </SelectContent>
               </Select>
 
@@ -599,92 +504,29 @@ function DownloadModal({ video, isOpen, onClose, onDownload, onPlayOnline, onSta
 
         {downloadProgress && (
           <div className="space-y-4">
-            {/* show server info messages (e.g. "Requested 1080p not available; will download 360p") */}
-            {downloadProgress.message && (
-              <div className="p-2 bg-yellow-100 text-yellow-800 rounded text-sm">{downloadProgress.message}</div>
-            )}
-
             <div className="space-y-2">
-              <div className="flex justify-between text-sm items-center">
-                <div className="flex items-center gap-2">
-                  {(downloadProgress.status === 'starting' || downloadProgress.status === 'downloading' || downloadProgress.status === 'processing') && (
-                    <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                  )}
-                  <span>
-                    {(() => {
-                      switch (downloadProgress.status) {
-                        case 'starting': return 'Iniciando...'
-                        case 'queued': return 'En cola'
-                        case 'downloading': return 'Descargando...'
-                        case 'processing':
-                        case 'finished': return 'Procesando...'
-                        case 'complete': return 'Completado'
-                        case 'error': return 'Error'
-                        default: return (downloadProgress.status || 'Estado desconocido')
-                      }
-                    })()}
-                  </span>
-                </div>
-
+              <div className="flex justify-between text-sm">
+                <span>{downloadProgress.status === 'downloading' ? 'Descargando...' : downloadProgress.status === 'finished' ? 'Procesando...' : 'Completado'}</span>
                 <span>
-                  {displayProgress != null
-                    ? `${displayProgress.toFixed(1)}%`
+                  {typeof downloadProgress.progress === 'number' && !isNaN(downloadProgress.progress)
+                    ? `${Math.min(Math.max(downloadProgress.progress, 0), 100).toFixed(1)}%`
                     : (downloadProgress.status === 'complete' || downloadProgress.status === 'finished') ? '100%' : '—'
                   }
                 </span>
               </div>
 
-              {displayProgress != null ? (
-                <>
-                  <div className="w-full bg-secondary rounded-full h-2">
-                    <div
-                      className="bg-primary h-2 rounded-full transition-all duration-300"
-                      style={{ width: `${displayProgress}%` }}
-                    />
-                  </div>
+              <div className="w-full bg-secondary rounded-full h-2">
+                <div
+                  className="bg-primary h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(typeof downloadProgress.progress === 'number' && !isNaN(downloadProgress.progress)) ? Math.min(Math.max(downloadProgress.progress, 0), 100) : (downloadProgress.status === 'complete' || downloadProgress.status === 'finished' ? 100 : 0)}%` }}
+                />
+              </div>
 
-                  {/* Speed + bytes line (prefer numeric speed_bps + downloaded/total when available) */}
-                  <div className="flex justify-between text-xs text-muted-foreground mt-2">
-                    <span>
-                      Velocidad: {downloadProgress.speed_bps != null ? `${formatFileSize(downloadProgress.speed_bps)}/s` : (downloadProgress.speed || 'N/A')}
-                    </span>
-                    {((downloadProgress.status === 'complete' || downloadProgress.status === 'finished')) ? (
-                      <span>Tiempo transcurrido: {formatDuration(downloadProgress.elapsed_seconds || 0)}</span>
-                    ) : (
-                      <span>Tiempo restante: {computeEta(downloadProgress)}</span>
-                    )}
-                  </div>
-
-                  {(downloadProgress.downloaded_bytes != null || downloadProgress.total_bytes != null) && (
-                    <div className="flex justify-between text-xs text-muted-foreground">
-                      <span>{downloadProgress.downloaded_bytes != null ? formatFileSize(downloadProgress.downloaded_bytes) : '—'}</span>
-                      <span>{downloadProgress.total_bytes != null ? formatFileSize(downloadProgress.total_bytes) : '—'}</span>
-                    </div>
-                  )}
-                </>
-              ) : (
-                // indeterminate state — show animated pulse bar and bytes/speed when available
-                <>
-                  <div className="w-full bg-secondary rounded-full h-2 overflow-hidden relative">
-                    <div className="absolute left-0 top-0 h-2 w-1/3 bg-primary/60 animate-pulse rounded-full" />
-                  </div>
-
-                  <div className="flex justify-between text-xs text-muted-foreground mt-2">
-                    <span>Velocidad: {downloadProgress.speed_bps != null ? `${formatFileSize(downloadProgress.speed_bps)}/s` : (downloadProgress.speed || 'N/A')}</span>
-                    {((downloadProgress.status === 'complete' || downloadProgress.status === 'finished')) ? (
-                      <span>Tiempo transcurrido: {formatDuration(downloadProgress.elapsed_seconds || 0)}</span>
-                    ) : (
-                      <span>Tiempo restante: {computeEta(downloadProgress)}</span>
-                    )}
-                  </div>
-
-                  {(downloadProgress.downloaded_bytes != null || downloadProgress.total_bytes != null) && (
-                    <div className="flex justify-between text-xs text-muted-foreground">
-                      <span>{downloadProgress.downloaded_bytes != null ? formatFileSize(downloadProgress.downloaded_bytes) : '—'}</span>
-                      <span>{downloadProgress.total_bytes != null ? formatFileSize(downloadProgress.total_bytes) : '—'}</span>
-                    </div>
-                  )}
-                </>
+              {downloadProgress.speed && downloadProgress.speed !== 'N/A' && (
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>Velocidad: {downloadProgress.speed}</span>
+                  <span>Tiempo restante: {downloadProgress.eta}</span>
+                </div>
               )}
 
               {/* Show requested vs actual resolution when they differ */}
@@ -712,124 +554,6 @@ function DownloadModal({ video, isOpen, onClose, onDownload, onPlayOnline, onSta
   )
 }
 
-// Playlist Modal
-function PlaylistModal({ playlist, isOpen, onClose, selections, toggleSelection, selectAll, deselectAll, statuses, resolution, setResolution, forceMerge, setForceMerge, onDownload, downloads }: {
-  playlist: PlaylistInfo | null
-  isOpen: boolean
-  onClose: () => void
-  selections: Record<string, boolean>
-  toggleSelection: (id: string) => void
-  selectAll: () => void
-  deselectAll: () => void
-  statuses: Record<string, string>
-  resolution: string
-  setResolution: (r: string) => void
-  forceMerge: boolean
-  setForceMerge: (b: boolean) => void
-  onDownload: () => void
-  downloads: Record<string, DownloadProgress & { title?: string; videoId?: string }>
-}) {
-  if (!playlist) return null
-
-  return (
-    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose() }}>
-      <DialogContent className="max-w-4xl w-full">
-        <DialogHeader>
-          <DialogTitle>Playlist: {playlist.title} <span className="text-sm text-muted-foreground ml-2">({playlist.count} items)</span></DialogTitle>
-          <DialogDescription className="mt-2">Selecciona los elementos que quieras descargar y presiona <strong>Descargar seleccionados</strong>.</DialogDescription>
-        </DialogHeader>
-
-        <div className="flex items-center justify-between gap-4 mb-4">
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="sm" onClick={selectAll}>Seleccionar todo</Button>
-            <Button variant="ghost" size="sm" onClick={deselectAll}>Desmarcar todo</Button>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 text-sm">
-              <span>Resolución</span>
-              <Select value={resolution} onValueChange={(v) => setResolution(v)}>
-                <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1080">1080p</SelectItem>
-                  <SelectItem value="720">720p</SelectItem>
-                  <SelectItem value="480">480p</SelectItem>
-                  <SelectItem value="360">360p</SelectItem>
-                  <SelectItem value="best">Mejor disponible</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="flex items-center gap-2 text-sm">
-              <input id="pm-ffmpeg" type="checkbox" checked={forceMerge} onChange={(e) => setForceMerge(e.target.checked)} />
-              <label htmlFor="pm-ffmpeg" className="text-sm">Forzar merge con ffmpeg</label>
-            </div>
-            <Button onClick={onDownload} className="ml-2">Descargar seleccionados</Button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-2 max-h-96 overflow-y-auto">
-          {playlist.entries.map((entry) => (
-            <div key={entry.id} className="flex items-center gap-3 p-2 rounded hover:bg-muted">
-              <input type="checkbox" checked={!!selections[entry.id]} onChange={() => toggleSelection(entry.id)} />
-              <img src={entry.thumbnail} className="w-24 h-14 object-cover rounded" alt="thumb" />
-              <div className="flex-1">
-                <div className="font-medium">{entry.title}</div>
-                <div className="text-xs text-muted-foreground">{entry.uploader || ''} • {entry.duration_formatted}</div>
-
-                {/* per-item progress (derived from global `downloads` state) */}
-                {(() => {
-                  const dl = Object.values(downloads || {}).reverse().find(d => d.videoId === entry.id)
-                  if (!dl) return null
-                  return (
-                    <div className="mt-2">
-                      <div className="flex items-center justify-between text-xs mb-1">
-                        <span className="text-muted-foreground">{dl.status === 'complete' ? 'Completado' : (dl.status === 'error' ? 'Error' : 'Descargando...')}</span>
-                        <span className="text-muted-foreground">{typeof dl.progress === 'number' ? `${Math.min(Math.max(dl.progress, 0), 100).toFixed(1)}%` : (dl.downloaded_bytes ? formatFileSize(dl.downloaded_bytes) : '—')}</span>
-                      </div>
-
-                      {typeof dl.progress === 'number' ? (
-                        <div className="w-full bg-secondary rounded-full h-2">
-                          <div className="bg-primary h-2 rounded-full transition-all duration-300" style={{ width: `${Math.min(Math.max(dl.progress, 0), 100)}%` }} />
-                        </div>
-                      ) : (
-                        <div className="w-full bg-secondary rounded-full h-2 overflow-hidden relative">
-                          <div className="absolute left-0 top-0 h-2 w-1/3 bg-primary/60 animate-pulse rounded-full" />
-                        </div>
-                      )}
-
-                      <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                        <span>Vel: {dl.speed_bps != null ? `${formatFileSize(dl.speed_bps)}/s` : (dl.speed || 'N/A')}</span>
-                        {((dl.status === 'complete' || dl.status === 'finished')) ? (
-                          <span>Tiempo: {formatDuration(dl.elapsed_seconds || 0)}</span>
-                        ) : (
-                          <span>ETA: {computeEta(dl)}</span>
-                        )}
-                      </div>
-
-                      {(dl.downloaded_bytes != null || dl.total_bytes != null) && (
-                        <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                          <span>{dl.downloaded_bytes != null ? formatFileSize(dl.downloaded_bytes) : '—'}</span>
-                          <span>{dl.total_bytes != null ? formatFileSize(dl.total_bytes) : '—'}</span>
-                        </div>
-                      )}
-                    </div>
-                  )
-                })()}
-              </div>
-              <div className="w-36 text-right">
-                {statuses[entry.id] === 'downloading' && <Badge className="bg-primary/10 text-primary">Descargando</Badge>}
-                {statuses[entry.id] === 'queued' && <Badge className="bg-muted/10">En cola</Badge>}
-                {statuses[entry.id] === 'done' && <Badge className="bg-green-100 text-green-700">Completado</Badge>}
-                {statuses[entry.id] === 'error' && <Badge className="bg-destructive/10 text-destructive">Error</Badge>}
-                {!statuses[entry.id] && <Badge className="bg-muted/10">Pendiente</Badge>}
-              </div>
-            </div>
-          ))}
-        </div>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 // Main Page
 export default function OfflineTube() {
   const [searchQuery, setSearchQuery] = useState('')
@@ -847,38 +571,16 @@ export default function OfflineTube() {
   const [downloadingVideo, setDownloadingVideo] = useState<VideoResult | null>(null)
   const [showDownload, setShowDownload] = useState(false)
 
-  // Playlist UI / state
-  const [playlistInfo, setPlaylistInfo] = useState<PlaylistInfo | null>(null)
-  const [showPlaylistModal, setShowPlaylistModal] = useState(false)
-  const [playlistSelections, setPlaylistSelections] = useState<Record<string, boolean>>({})
-  const [playlistStatuses, setPlaylistStatuses] = useState<Record<string, string>>({})
-  const [playlistResolution, setPlaylistResolution] = useState<string>('720')
-  const [playlistForceMergeWithFFmpeg, setPlaylistForceMergeWithFFmpeg] = useState<boolean>(true)
+  // Auth (NextAuth)
+  const { data: session } = useSession()
 
+  // Personal trends (YouTube activities)
+  const [personalTrends, setPersonalTrends] = useState<VideoResult[]>([])
+  const [loadingPersonalTrends, setLoadingPersonalTrends] = useState(false)
 
   // Background download manager (keeps downloads running even if modal closes)
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress & { title?: string; videoId?: string }>>({})
-  const downloadsRef = useRef(downloads)
   const wsRefs = useRef<Record<string, WebSocket>>({})
-
-  useEffect(() => { downloadsRef.current = downloads }, [downloads])
-
-  // helper: wait until a downloads entry for videoId reaches 'complete' or 'error'
-  const waitForDownloadFinish = (videoId: string, pollMs = 500) => new Promise<{ success: boolean }>((resolve) => {
-    const timer = setInterval(() => {
-      const items = Object.values(downloadsRef.current).filter(d => d.videoId === videoId)
-      if (!items.length) return
-      const last = items[items.length - 1]
-      if (!last) return
-      if (last.status === 'complete') {
-        clearInterval(timer)
-        resolve({ success: true })
-      } else if (last.status === 'error') {
-        clearInterval(timer)
-        resolve({ success: false })
-      }
-    }, pollMs)
-  })
 
   // Start a websocket-backed download (managed at page level so it survives modal close)
   const startDownload = (video: VideoResult, formatId: string, resolution: string, options?: { forceMergeWithFFmpeg?: boolean }) => {
@@ -888,186 +590,78 @@ export default function OfflineTube() {
     // optimistic entry so UI shows an item immediately
     setDownloads((d) => ({
       ...d,
-      [downloadKey]: { status: 'starting', progress: null, speed: 'N/A', eta: 'N/A', filename: '', title: video.title, videoId: video.id, requested_resolution: Number(resolution) || null, started_at: Date.now() }
+      [downloadKey]: { status: 'starting', progress: null, speed: 'N/A', eta: 'N/A', filename: '', title: video.title, videoId: video.id, requested_resolution: Number(resolution) || null }
     }))
 
-    // Try primary (proxied) URL first; if WS fails to open, fall back to connecting directly to backend
-    const primaryUrl = `${protocol}//${window.location.host}/ws/download?XTransformPort=8001`
-    const fallbackUrl = `${protocol}//${window.location.hostname}:8001/ws/download`
-    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    const initialUrl = isLocalhost ? fallbackUrl : primaryUrl
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/download?XTransformPort=8001`)
+    wsRefs.current[downloadKey] = ws
 
-    let triedFallback = false
-    let fallbackTimer: ReturnType<typeof setTimeout> | null = null
-
-    const createSocket = (url: string) => {
-      console.info(`[WS] connecting -> ${url}`)
-      const s = new WebSocket(url)
-      wsRefs.current[downloadKey] = s
-      return s
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        type: 'download',
+        url: video.url,
+        format_id: formatId,
+        resolution: resolution,
+        use_ffmpeg: Boolean(options?.forceMergeWithFFmpeg)
+      }))
     }
 
-    let ws = createSocket(initialUrl)
+    ws.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data)
+        // payload should contain 'filename' and 'status' and maybe 'progress'
+        setDownloads((prev) => {
+          // find the entry for this downloadKey (we keep using downloadKey)
+          const existing = prev[downloadKey] || { title: video.title, videoId: video.id }
+          const updated: any = { ...existing, ...payload }
+          // normalize progress when null/undefined
+          if (typeof updated.progress !== 'number' || isNaN(updated.progress)) {
+            updated.progress = updated.progress == null ? updated.progress : Number(updated.progress)
+          }
+          // if finished -> mark complete
+          if (payload.status === 'complete' || payload.status === 'finished') {
+            updated.status = 'complete'
+            // ensure progress is 100
+            updated.progress = 100
+          }
+          return { ...prev, [downloadKey]: updated }
+        })
 
-    let wsOpened = false
-    const connTimeoutMs = 8000
-    const connTimer = setTimeout(() => {
-      if (!wsOpened) {
-        // if we haven't tried fallback yet, attempt it once
-        if (!triedFallback) {
-          console.info(`[WS] connection timed out to primary; attempting fallback -> ${fallbackUrl}`)
-          triedFallback = true
-          try { ws.close() } catch (e) {}
-          ws = createSocket(fallbackUrl)
+        if (payload.status === 'complete' || payload.status === 'finished') {
+          // refresh library
+          loadLibrary()
+          // close websocket for this download
+          try { wsRefs.current[downloadKey]?.close() } catch (e) {}
+          delete wsRefs.current[downloadKey]
+          // remove completed downloads after a short delay
+          setTimeout(() => {
+            setDownloads((prev) => {
+              const copy = { ...prev }
+              delete copy[downloadKey]
+              return copy
+            })
+          }, 4000)
+        }
 
-          // fallback must connect within a short window or we consider it failed
-          if (fallbackTimer) clearTimeout(fallbackTimer)
-          fallbackTimer = setTimeout(() => {
-            if (!wsOpened) {
-              setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: 'No se pudo conectar al servidor (WebSocket)' } }))
-              try { ws.close() } catch (e) {}
-              delete wsRefs.current[downloadKey]
-            }
-          }, connTimeoutMs)
-        } else {
-          setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: 'No se pudo conectar al servidor (WebSocket)' } }))
-          try { ws.close() } catch (e) {}
+        if (payload.status === 'error') {
+          // keep the error in state for UI
+          setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: payload.error } }))
+          try { wsRefs.current[downloadKey]?.close() } catch (e) {}
           delete wsRefs.current[downloadKey]
         }
-      }
-    }, connTimeoutMs)
-
-    const attachHandlers = (socket: WebSocket) => {
-      socket.onopen = () => {
-        console.info(`[WS] open -> ${socket.url}`)
-        // clear any fallback timer (we're connected)
-        if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null }
-        wsOpened = true
-        clearTimeout(connTimer)
-        setDownloads((prev) => ({ ...(prev), [downloadKey]: { ...(prev[downloadKey] || {}), status: 'starting' } }))
-
-        socket.send(JSON.stringify({
-          type: 'download',
-          url: video.url,
-          format_id: formatId,
-          resolution: resolution,
-          use_ffmpeg: Boolean(options?.forceMergeWithFFmpeg)
-        }))
-      }
-
-      socket.onmessage = (ev) => {
-        try {
-          const payload = JSON.parse(ev.data)
-
-          if (payload.downloaded_bytes != null && payload.total_bytes) {
-            try {
-              const pct = (Number(payload.downloaded_bytes) / Number(payload.total_bytes)) * 100
-              payload.progress = isFinite(pct) ? Number(pct.toFixed(2)) : null
-            } catch (e) {
-              payload.progress = payload.progress == null ? null : Number(payload.progress)
-            }
-          } else if (payload.progress != null) {
-            payload.progress = Number(payload.progress)
-          }
-
-          if (payload.speed_bps != null) payload.speed_bps = Number(payload.speed_bps)
-
-          setDownloads((prev) => {
-            const existing = prev[downloadKey] || { title: video.title, videoId: video.id }
-            const updated: any = { ...existing, ...payload }
-
-            if (updated.progress != null && !isNaN(updated.progress)) {
-              updated.progress = Number(updated.progress)
-            } else {
-              updated.progress = updated.progress == null ? null : Number(updated.progress)
-            }
-
-            if (payload.downloaded_bytes != null) updated.downloaded_bytes = Number(payload.downloaded_bytes)
-            if (payload.total_bytes != null) updated.total_bytes = Number(payload.total_bytes)
-
-            if (payload.status === 'complete' || payload.status === 'finished') {
-              updated.status = 'complete'
-              updated.progress = 100
-              if (!updated.total_bytes && updated.size) updated.total_bytes = Number(updated.size)
-              if (!updated.downloaded_bytes && updated.total_bytes) updated.downloaded_bytes = updated.total_bytes
-
-              // client-side: compute elapsed time + average speed when we have a start timestamp
-              try {
-                const startedAt = existing && (existing.started_at || (existing as any).started_at)
-                if (startedAt && updated.total_bytes != null) {
-                  const elapsedMs = Math.max(0, Date.now() - Number(startedAt))
-                  const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000))
-                  const avg = Math.floor(Number(updated.total_bytes) / elapsedSec)
-                  updated.elapsed_seconds = elapsedSec
-                  updated.avg_speed_bps = avg
-                  if (!updated.speed_bps) updated.speed_bps = avg
-                }
-              } catch (e) {
-                /* ignore */
-              }
-            }
-
-            return { ...prev, [downloadKey]: updated }
-          })
-
-          if (payload.status === 'complete' || payload.status === 'finished') {
-            loadLibrary()
-            try { wsRefs.current[downloadKey]?.close() } catch (e) {}
-            delete wsRefs.current[downloadKey]
-            setTimeout(() => {
-              setDownloads((prev) => {
-                const copy = { ...prev }
-                delete copy[downloadKey]
-                return copy
-              })
-            }, 4000)
-          }
-
-          if (payload.status === 'error') {
-            setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: payload.error } }))
-            try { wsRefs.current[downloadKey]?.close() } catch (e) {}
-            delete wsRefs.current[downloadKey]
-          }
-        } catch (err) {
-          console.error('WS parse error', err)
-        }
-      }
-
-      socket.onerror = (e) => {
-        console.info(`[WS] error -> ${socket.url}`, e)
-        // clear any fallback timer if present
-        if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null }
-
-        // if error before open and we haven't tried fallback, try fallback once
-        if (!wsOpened && !triedFallback) {
-          console.info('[WS] primary failed, attempting fallback...')
-          triedFallback = true
-          try { socket.close() } catch (err) {}
-          ws = createSocket(fallbackUrl)
-          attachHandlers(ws)
-          return
-        }
-
-        // If primary socket errored but we've already started fallback, ignore the primary's error
-        if (!wsOpened && triedFallback && socket.url === primaryUrl) {
-          console.info('[WS] primary socket errored after fallback started — ignoring primary error')
-          try { socket.close() } catch (err) {}
-          return
-        }
-
-        clearTimeout(connTimer)
-        setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: 'WebSocket error' } }))
-      }
-
-      socket.onclose = () => {
-        // cleanup timers & refs
-        if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null }
-        clearTimeout(connTimer)
-        delete wsRefs.current[downloadKey]
+      } catch (err) {
+        console.error('WS parse error', err)
       }
     }
 
-    attachHandlers(ws)
+    ws.onerror = (e) => {
+      setDownloads((prev) => ({ ...prev, [downloadKey]: { ...(prev[downloadKey] || {}), status: 'error', error: 'WebSocket error' } }))
+    }
+
+    ws.onclose = () => {
+      // leave state as-is (complete/error will be handled elsewhere)
+      delete wsRefs.current[downloadKey]
+    }
   }
 
   // Cancel all websockets when the page unmounts
@@ -1083,8 +677,49 @@ export default function OfflineTube() {
     loadLibrary()
   }, [])
 
+  // Load personal trends when session and access token are available
+  useEffect(() => {
+    const accessToken = (session as any)?.user?.accessToken
+    if (accessToken) {
+      loadPersonalTrends(accessToken)
+    } else {
+      setPersonalTrends([])
+    }
+  }, [session])
 
   // Fetch user's YouTube activities (mapped to VideoResult)
+  const loadPersonalTrends = async (accessToken: string) => {
+    setLoadingPersonalTrends(true)
+    try {
+      const res = await fetch('https://www.googleapis.com/youtube/v3/activities?part=snippet,contentDetails&mine=true&maxResults=20', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      })
+      if (!res.ok) throw new Error(`YouTube API error ${res.status}`)
+      const data = await res.json()
+      const items = data.items || []
+      const mapped: VideoResult[] = items.map((it: any) => {
+        const vid = it.contentDetails?.upload?.videoId || it.contentDetails?.playlistItem?.resourceId?.videoId || (it.contentDetails?.like?.resourceId?.videoId) || null
+        if (!vid) return null
+        const sn = it.snippet || {}
+        return {
+          id: vid,
+          title: sn.title || 'Sin título',
+          thumbnail: (sn.thumbnails && (sn.thumbnails.medium || sn.thumbnails.default)) ? (sn.thumbnails.medium || sn.thumbnails.default).url : '',
+          duration: 0,
+          uploader: sn.channelTitle || '',
+          view_count: 0,
+          url: `https://www.youtube.com/watch?v=${vid}`
+        }
+      }).filter(Boolean)
+      setPersonalTrends(mapped)
+    } catch (err) {
+      console.error('Failed to load personal trends:', err)
+      // if token is invalid or insufficient scopes, sign out to force re-auth
+      // (user can sign in again with expanded scopes)
+    } finally {
+      setLoadingPersonalTrends(false)
+    }
+  }
 
   const loadTrending = async () => {
     setLoading(true)
@@ -1113,32 +748,9 @@ export default function OfflineTube() {
     e.preventDefault()
     if (!searchQuery.trim()) return
 
-    // Detect playlist URL (YouTube commonly uses 'list=' query param)
-    const isPlaylistUrl = /[?&]list=([a-zA-Z0-9_-]+)/.test(searchQuery) || /youtube\.com\/playlist/.test(searchQuery)
-
     setLoading(true)
     setActiveTab('search')
-
     try {
-      if (isPlaylistUrl) {
-        try {
-          const res = await fetch(`/api/playlist/info?url=${encodeURIComponent(searchQuery)}&XTransformPort=8001`)
-          const data = await res.json()
-          if (!data.error && data.entries && data.entries.length > 0) {
-            setPlaylistInfo(data)
-            // initialize selections (default: all selected)
-            const sel: Record<string, boolean> = {}
-            data.entries.forEach((it: any) => { sel[it.id] = true })
-            setPlaylistSelections(sel)
-            setShowPlaylistModal(true)
-            setVideos([])
-            return
-          }
-        } catch (err) {
-          console.error('Playlist fetch failed, falling back to search:', err)
-        }
-      }
-
       const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&XTransformPort=8001`)
       const data = await res.json()
       setVideos(data.results || [])
@@ -1171,49 +783,6 @@ export default function OfflineTube() {
       loadLibrary()
     } catch (err) {
       console.error('Error deleting video:', err)
-    }
-  }
-
-  // Playlist helpers
-  const togglePlaylistSelection = (id: string) => {
-    setPlaylistSelections((s) => ({ ...s, [id]: !s[id] }))
-  }
-  const selectAllPlaylist = () => {
-    if (!playlistInfo) return
-    const sel: Record<string, boolean> = {}
-    playlistInfo.entries.forEach((e) => { sel[e.id] = true })
-    setPlaylistSelections(sel)
-  }
-  const deselectAllPlaylist = () => setPlaylistSelections({})
-
-  const downloadSelectedPlaylist = async () => {
-    if (!playlistInfo) return
-    const selectedIds = Object.keys(playlistSelections).filter((k) => playlistSelections[k])
-    if (selectedIds.length === 0) return
-
-    // mark queued
-    selectedIds.forEach((id) => setPlaylistStatuses((p) => ({ ...p, [id]: 'queued' })))
-
-    for (const entry of playlistInfo.entries.filter((e) => selectedIds.includes(e.id))) {
-      setPlaylistStatuses((p) => ({ ...p, [entry.id]: 'downloading' }))
-
-      // start WS-backed download and wait for it to finish
-      const fakeVideo: VideoResult = { id: entry.id, title: entry.title, thumbnail: entry.thumbnail, duration: entry.duration || 0, uploader: entry.uploader || '', view_count: 0, url: entry.url }
-      try {
-        startDownload(fakeVideo, '', playlistResolution, { forceMergeWithFFmpeg: playlistForceMergeWithFFmpeg })
-        const res = await waitForDownloadFinish(entry.id)
-        if (res.success) {
-          setPlaylistStatuses((p) => ({ ...p, [entry.id]: 'done' }))
-        } else {
-          setPlaylistStatuses((p) => ({ ...p, [entry.id]: 'error' }))
-        }
-      } catch (err) {
-        console.error('Playlist WS download failed for', entry.url, err)
-        setPlaylistStatuses((p) => ({ ...p, [entry.id]: 'error' }))
-      }
-
-      // small delay between sequential downloads (prevent hammering)
-      await new Promise((r) => setTimeout(r, 400))
     }
   }
 
@@ -1320,6 +889,18 @@ export default function OfflineTube() {
               </Button>
             </form>
 
+            {/* Google Sign-In */}
+            <div className="ml-4">
+              {(session as any)?.user ? (
+                <div className="flex items-center gap-3">
+                  <User className="h-4 w-4" />
+                  <div className="text-sm">{(session as any).user?.name}</div>
+                  <Button variant="ghost" size="sm" onClick={() => signOut()}>Cerrar sesión</Button>
+                </div>
+              ) : (
+                <Button onClick={() => signIn('google')} className="rounded-full">Entrar con Google</Button>
+              )}
+            </div>
 
             {/* Background downloads indicator (circular) */}
             {Object.keys(downloads).length > 0 && (
@@ -1372,6 +953,33 @@ export default function OfflineTube() {
               ) : (
                 <>
                   {/* Personal trends for signed-in users */}
+                  {(session as any)?.user && (
+                    <div className="mb-6">
+                      <div className="flex items-center justify-between mb-3">
+                        <h2 className="text-lg font-semibold">Tendencias para ti</h2>
+                        <div className="text-xs text-muted-foreground">Basado en tu cuenta de YouTube</div>
+                      </div>
+
+                      {loadingPersonalTrends ? (
+                        <div className="flex items-center justify-center py-6">
+                          <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                        </div>
+                      ) : personalTrends.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">No hay actividades recientes o falta autorización para YouTube.</div>
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 mb-6">
+                          {personalTrends.map((video) => (
+                            <VideoCard
+                              key={video.id}
+                              video={video}
+                              onPlay={handlePlay}
+                              onDownload={handleDownloadClick}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Global/Trending results */}
                   {videos.length === 0 ? (
@@ -1442,40 +1050,21 @@ export default function OfflineTube() {
       {(() => {
         const currentDownload = downloadingVideo ? Object.values(downloads).find(d => d.videoId === downloadingVideo.id) : undefined
         return (
-          <>
-            <DownloadModal
-              video={downloadingVideo}
-              isOpen={showDownload}
-              onClose={() => setShowDownload(false)}
-              onDownload={handleDownloadComplete}
-              onPlayOnline={() => {
-                if (downloadingVideo) {
-                  handlePlay(downloadingVideo)
-                }
-              }}
-              onStartDownload={(formatId: string, resolution: string, options?: { forceMergeWithFFmpeg?: boolean }) => {
-                if (downloadingVideo) startDownload(downloadingVideo, formatId, resolution, options)
-              }}
-              downloadProgress={currentDownload}
-            />
-
-            <PlaylistModal
-              playlist={playlistInfo}
-              isOpen={showPlaylistModal}
-              onClose={() => setShowPlaylistModal(false)}
-              selections={playlistSelections}
-              toggleSelection={togglePlaylistSelection}
-              selectAll={selectAllPlaylist}
-              deselectAll={deselectAllPlaylist}
-              statuses={playlistStatuses}
-              resolution={playlistResolution}
-              setResolution={setPlaylistResolution}
-              forceMerge={playlistForceMergeWithFFmpeg}
-              setForceMerge={setPlaylistForceMergeWithFFmpeg}
-              onDownload={downloadSelectedPlaylist}
-              downloads={downloads}
-            />
-          </>
+          <DownloadModal
+            video={downloadingVideo}
+            isOpen={showDownload}
+            onClose={() => setShowDownload(false)}
+            onDownload={handleDownloadComplete}
+            onPlayOnline={() => {
+              if (downloadingVideo) {
+                handlePlay(downloadingVideo)
+              }
+            }}
+            onStartDownload={(formatId: string, resolution: string, options?: { forceMergeWithFFmpeg?: boolean }) => {
+              if (downloadingVideo) startDownload(downloadingVideo, formatId, resolution, options)
+            }}
+            downloadProgress={currentDownload}
+          />
         )
       })()}
     </div>

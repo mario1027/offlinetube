@@ -1,0 +1,4 @@
+yt-dlp>=2026.02.04
+# Optional but recommended:
+# requests
+# ffmpeg should be installed on the host (apt, brew, etc.)
